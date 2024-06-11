@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Ignore extension/dist directories
+extension/dist/
+
 # Node.js
 node_modules/
 npm-debug.log
