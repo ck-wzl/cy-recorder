@@ -1,16 +1,17 @@
-import { onMessage } from 'webext-bridge/background'
+import { onMessage, sendMessage } from 'webext-bridge/background'
 import type { Runtime, WebNavigation } from 'webextension-polyfill'
 import { handleCreateBlock, handleUrlEvent, handleVisitEvent } from '~/helper/codeGenerator'
-import { useWebExtensionStorage } from '~/composables/useWebExtensionStorage'
+import codeOperation from '~/helper/codeOperation'
 import { ActionState, EventType, RecState } from '~/constants'
-import type { ICodeBlock, ParsedEvent } from '~/interface'
-import { isFirefox, isForbiddenUrl } from '~/env'
+import type { ParsedEvent } from '~/interface'
 
 if (import.meta.hot) {
-  // @ts-expect-error
+  // @ts-expect-error TODO@wzl 后续可以去掉
   import('/@vite/client')
   import('./contentScriptHMR')
 }
+
+const operation = new codeOperation()
 
 const session: {
   activePort: Runtime.Port | null
@@ -22,17 +23,12 @@ const session: {
   lastURL: '',
 }
 
-// 当前录制状态
-const recStatus = useWebExtensionStorage('recStatus', RecState.Off)
-
-// 当前代码块
-const codeBlocks = useWebExtensionStorage('codeBlocks', [] as ICodeBlock[])
+const isRecording = () => {
+  return operation.recStatus === RecState.On
+}
 
 // 在导航事件（尤其是主框架的导航事件）发生时断开当前活动端口的连接
 const disconnectActivePortOnNavigation = (details?: WebNavigation.OnBeforeNavigateDetailsType): void => {
-  // frameId === 0 表示导航发生在选项卡内容窗口中
-  // 正值表示子框架中的导航
-  // frameId 对于给定选项卡和进程是唯一的。
   if (session.activePort && (!details || details.frameId === 0)) {
     session.activePort.disconnect()
   }
@@ -40,13 +36,11 @@ const disconnectActivePortOnNavigation = (details?: WebNavigation.OnBeforeNaviga
 
 // 处理导航提交时的事件
 const handleNavigationEvent = (details: WebNavigation.OnCommittedDetailsType): void => {
-  // 是否是主界面
+  if (!isRecording()) return
+
   const isMainFrame = details.frameId === 0
-  // 是否非当前活动端口
   const isDifferentHost = !details.url.includes(session.originalHost ?? '')
-  // 是否导航是通过前进/后退按钮触发的
   const isFromForwardBack = details.transitionQualifiers.includes('forward_back')
-  // 是否导航是通过地址栏触发的
   const isFromAddressBar = details.transitionQualifiers.includes('from_address_bar')
 
   if (isMainFrame && (isDifferentHost || isFromForwardBack || isFromAddressBar)) {
@@ -56,130 +50,177 @@ const handleNavigationEvent = (details: WebNavigation.OnCommittedDetailsType): v
 
   if (details.url.includes(session.originalHost ?? '')) {
     const urlBlock = handleUrlEvent(details.url)
-    codeBlocks.value.push({ code: urlBlock, prompt: 'prompt-----url' })
+    operation.addCodeBlock(urlBlock).then(() => {
+      sendMessage('background-action-message', {
+        action: ActionState.Add,
+        code: urlBlock
+      })
+    })
   }
 }
 
 // 向页面注入事件记录器脚本
-const injectEventRecorderScript = (details?: WebNavigation.OnDOMContentLoadedDetailsType): void => {
-  if (!details || details.frameId !== 0 || isForbiddenUrl(details.url))
-    return
+const injectEventRecorderScript = (details?: WebNavigation.OnDOMContentLoadedDetailsType): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    if (!isRecording()) {
+      resolve()
+      return
+    }
 
-  browser.tabs.executeScript(details.tabId, {
-    file: `${isFirefox ? '' : '.'}/dist/contentScripts/index.global.js`,
-    runAt: 'document_end',
-  }).catch((error: any) => console.error('[cypress-recorder][background]注入脚本报错：', error))
+    const tabId = details?.tabId ?? session.activePort?.sender?.tab?.id
+
+    if (!tabId) {
+      console.warn('[cypress-recorder][background]无法找到 tabId, 无法注入脚本')
+      resolve()
+      return
+    }
+
+    if (!details || details.frameId === 0) {
+      browser.scripting.executeScript({
+        target: { tabId },
+        files: ['dist/contentScripts/index.global.js'],
+      }, () => {
+        if (browser.runtime.lastError) {
+          console.error('[cypress-recorder][background]注入脚本报错：', browser.runtime.lastError)
+          reject(browser.runtime.lastError)
+        } else {
+          console.log('[cypress-recorder][background]注入脚本成功')
+          resolve()
+        }
+      })
+    } else {
+      resolve()
+    }
+  })
 }
 
 // 开始录制
-const startRecord = async () => {
-  injectEventRecorderScript()
-  recStatus.value = RecState.On
-  await Promise.resolve()
-  browser.action.setBadgeText({ text: 'rec' })
+const startRecord = () => {
+  return new Promise<void>((resolve, reject) => {
+    injectEventRecorderScript().then(() => {
+      operation.updateState(RecState.On).then(() => {
+        browser.action.setBadgeText({ text: 'rec' })
+        resolve()
+      }).catch(reject)
+    }).catch(reject)
+  })
 }
 
 // 结束录制
-const pauseRecord = async () => {
-  disconnectActivePortOnNavigation()
-  browser.webNavigation.onDOMContentLoaded.removeListener(injectEventRecorderScript)
-  browser.webNavigation.onCommitted.removeListener(handleNavigationEvent)
-  browser.webNavigation.onBeforeNavigate.removeListener(disconnectActivePortOnNavigation)
-  recStatus.value = RecState.Paused
-  await Promise.resolve()
-  session.activePort = null;
-  session.originalHost = null;
-  browser.action.setBadgeText({ text: 'pause' })
+const pauseRecord = () => {
+  return new Promise<void>((resolve) => {
+    disconnectActivePortOnNavigation()
+    browser.webNavigation.onDOMContentLoaded.removeListener(injectEventRecorderScript)
+    browser.webNavigation.onCommitted.removeListener(handleNavigationEvent)
+    browser.webNavigation.onBeforeNavigate.removeListener(disconnectActivePortOnNavigation)
+
+    operation.updateState(RecState.Paused).then(() => {
+      session.activePort = null
+      session.originalHost = null
+      browser.action.setBadgeText({ text: 'pause' })
+      resolve()
+    })
+  })
 }
 
 // 重置录制
-const resetRecord = async () => {
-  session.lastURL = ''
-  recStatus.value = RecState.Off
-  codeBlocks.value = []
-  await Promise.resolve()
-  browser.action.setBadgeText({ text: '' })
+const resetRecord = () => {
+  return new Promise<void>((resolve) => {
+    session.lastURL = ''
+    operation.resetState().then(() => {
+      browser.action.setBadgeText({ text: '' })
+      resolve()
+    })
+  })
 }
 
 // 执行清理的操作
 const clearUp = () => {
   disconnectActivePortOnNavigation()
-  recStatus.value = RecState.Off
-  codeBlocks.value = []
+  operation.init()
 }
 
-clearUp()
+// 初始化操作
+(() => {
+  clearUp()
 
-// 安装时的监听事件
-browser.runtime.onInstalled.addListener(() => console.log('[cypress-recorder][background]扩展已安装'))
+  // 安装时的监听事件
+  browser.runtime.onInstalled.addListener(() => console.log('[cypress-recorder][background]扩展已安装'))
 
-// 连接时的监听事件
-browser.runtime.onConnect.addListener((port: Runtime.Port) => {
-  session.activePort = port
-  if (recStatus.value === RecState.On) {
-    // 存储当前活动端口的名称（通常是扩展连接的名称）
-    session.originalHost = port.name
+  // 连接时的监听事件
+  browser.runtime.onConnect.addListener((port: Runtime.Port) => {
+    session.activePort = port
 
-    // 在即将发生导航时触发
-    browser.webNavigation.onBeforeNavigate.addListener(disconnectActivePortOnNavigation)
-    // 在提交导航时触发，浏览器已决定切换到新文档。
-    browser.webNavigation.onCommitted.addListener(handleNavigationEvent)
-    // 当页面的 DOM 已完全构建，但引用的资源可能无法完成加载时触发。
-    browser.webNavigation.onDOMContentLoaded.addListener(injectEventRecorderScript, { url: [{ hostEquals: session.originalHost }] })
+    port.onDisconnect.addListener(() => {
+      console.log('[cypress-recorder][background]Port disconnected!')
+      session.activePort = null
+    })
 
-    if (port.sender && port.sender.url && session.lastURL !== port.sender.url) {
-      const visitBlock = handleVisitEvent(port.sender.url)
-      session.lastURL = port.sender.url
-      codeBlocks.value.push({ code: visitBlock, prompt: 'prompt-----visit' })
+    if (isRecording()) {
+      session.originalHost = port.name
+
+      browser.webNavigation.onBeforeNavigate.addListener(disconnectActivePortOnNavigation)
+      browser.webNavigation.onCommitted.addListener(handleNavigationEvent)
+      browser.webNavigation.onDOMContentLoaded.addListener(injectEventRecorderScript, { url: [{ hostEquals: session.originalHost }] })
+
+      if (port.sender && port.sender.url && session.lastURL !== port.sender.url) {
+        const visitBlock = handleVisitEvent(port.sender.url)
+        session.lastURL = port.sender.url
+        operation.addCodeBlock(visitBlock).then(() => {
+          sendMessage('background-action-message', {
+            action: ActionState.Add,
+            code: visitBlock
+          })
+        })
+      }
     }
-  }
-})
+  })
 
-// 接受来自contentScript的content-event-message
-onMessage<{ event: ParsedEvent }, 'content-event-message'>('content-event-message', async (event) => {
-  console.log('[cypress-recorder][background]接受来自content的event消息: ', event)
+  // 接受来自contentScript的content-event-message
+  onMessage<{ event: ParsedEvent }, 'content-event-message'>('content-event-message', async (event) => {
+    if (!isRecording()) return
 
-  const eventObject = event.data.event
+    console.log('[cypress-recorder][background]接受来自content的event消息: ', event)
 
-  /** TODO@WZL 这里还可以生成prompt */
-  const block = await handleCreateBlock(eventObject)
+    const eventObject = event.data.event
+    const block = await handleCreateBlock(eventObject)
 
-  if (!block) {
-    return
-  }
+    if (block === null) {
+      return
+    }
 
-  if (eventObject.action === EventType.DblClick) {
-    // 双击时，会注入两个单击事件进去，所以需要先删除前面两个单击事件
-    codeBlocks.value.splice(codeBlocks.value.length - 2, 2)
-    await Promise.resolve()
-    codeBlocks.value.push({ code: block, prompt: 'prompt-----双击', })
-  } else {
-    codeBlocks.value.push({ code: block, prompt: 'prompt-----非双击', })
-  }
-})
+    if (eventObject.action === EventType.DblClick) {
+      operation.popTwoCodeBlock().then(() => {
+        operation.addCodeBlock(block)
+      })
+    } else {
+      operation.addCodeBlock(block)
+    }
+  })
 
-// 接受来自popup的popup-action-message
-onMessage<{ action: ActionState }, 'popup-action-message'>('popup-action-message', async (event) => {
-  console.log('[cypress-recorder][background]接受来自popup的action消息: ', event)
+  // 接受来自popup的popup-action-message
+  onMessage<{ action: ActionState }, 'popup-action-message'>('popup-action-message', async (event) => {
+    console.log('[cypress-recorder][background]接受来自popup的action消息: ', event)
 
-  const actionStr = event.data.action
+    const actionStr = event.data.action
 
-  switch (actionStr) {
-    case ActionState.Start:
-    case ActionState.Resume:
-      await startRecord()
-      break
+    switch (actionStr) {
+      case ActionState.Start:
+      case ActionState.Resume:
+        await startRecord()
+        break
 
-    case ActionState.Pause:
-      await pauseRecord()
-      break
+      case ActionState.Pause:
+        await pauseRecord()
+        break
 
-    case ActionState.Reset:
-      await resetRecord()
-      break
+      case ActionState.Reset:
+        await resetRecord()
+        break
 
-    default:
-      console.error(`[cypress-recorder][background]未捕获的操作：${actionStr}`)
-      break
-  }
-})
+      default:
+        console.error(`[cypress-recorder][background]未捕获的操作：${actionStr}`)
+        break
+    }
+  })
+})()

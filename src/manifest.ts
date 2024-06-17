@@ -31,6 +31,7 @@ export async function getManifest() {
       'tabs',
       'storage',
       'activeTab',
+      'scripting',
       'webNavigation'
     ],
     host_permissions: ['*://*/*'],
