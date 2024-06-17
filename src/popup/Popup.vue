@@ -12,10 +12,9 @@
  * @file Popup组件主入口
  */
 
-import { sendMessage } from 'webext-bridge/popup'
+import { onMessage, sendMessage } from 'webext-bridge/popup'
 import { ActionState, ContentType, RecState } from '~/constants'
 import type { ICodeBlock } from '~/interface'
-import { useWebExtensionStorage } from '~/composables/useWebExtensionStorage'
 import { isForbiddenUrl } from '~/env'
 import type { Tabs } from 'webextension-polyfill'
 import PopupHead from './PopupHead.vue'
@@ -23,13 +22,29 @@ import PopupBody from './PopupBody.vue'
 import PopupFoot from './PopupFoot.vue'
 
 // 录制状态
-const recStatus = useWebExtensionStorage('recStatus', RecState.Off)
+const recStatus = ref(RecState.Off)
 
 // 代码块
-const codeBlocks = useWebExtensionStorage('codeBlocks', [] as ICodeBlock[])
+const codeBlocks = ref<ICodeBlock[]>([])
 
 // 是否是合格的tab
 const isValidTab = ref(true)
+
+// 开始录制
+const startRecording = () => {
+    recStatus.value = RecState.On
+}
+
+// 暂停录制
+const pauseRecording = () => {
+    recStatus.value = RecState.Paused
+}
+
+// 重置录制
+const resetRecording = () => {
+    recStatus.value = RecState.Off
+    codeBlocks.value = []
+}
 
 // 处理切换事件
 const handleToggle = (action: ActionState) => {
@@ -38,20 +53,22 @@ const handleToggle = (action: ActionState) => {
         // 开始/继续
         case ActionState.Start:
         case ActionState.Resume:
-            recStatus.value = RecState.On
-            codeBlocks.value = []
+            // 开始或继续的时候，主动关闭popup
+            window.close()
+            startRecording()
             break
 
         // 暂停
         case ActionState.Pause:
-            recStatus.value = RecState.Paused
+            pauseRecording()
             break
 
         // 重置
         case ActionState.Reset:
+            resetRecording()
+            break
+
         default:
-            recStatus.value = RecState.Off
-            codeBlocks.value = []
             break
     }
 
@@ -74,17 +91,46 @@ const copyToClipboard = async (type: ContentType) => {
 }
 
 onMounted(() => {
-    const status = useWebExtensionStorage('recStatus', recStatus.value)
-    recStatus.value = status.value
-
-    const blocks = useWebExtensionStorage('codeBlocks', codeBlocks.value)
-    codeBlocks.value = blocks.value
+    browser.storage.local.get(['recStatus', 'codeBlocks']).then((result: any) => {
+        if (result.codeBlocks) codeBlocks.value = result.codeBlocks
+        if (result.recStatus !== RecState.Off) recStatus.value = result.recStatus
+    })
 
     // active: 选项卡在其窗口中是否处于活动状态 currentWindow: 选项卡是否在当前窗口中
     browser.tabs.query({ active: true, currentWindow: true }).then(([tab]: Tabs.Tab[]) => {
         // 是否是禁止访问的URL
         const result = tab.url ? isForbiddenUrl(tab.url) : true
         isValidTab.value = !result
+    })
+
+    // 接受来自background的消息
+    onMessage<{ action: ActionState; code: ICodeBlock }>('background-action-message', (value) => {
+        if (!isValidTab.value) return
+
+        const { data: { action, code } } = value
+
+        switch (action) {
+            case ActionState.Start:
+            case ActionState.Resume:
+                window.close()
+                startRecording()
+                break
+
+            case ActionState.Pause:
+                pauseRecording()
+                break
+
+            case ActionState.Reset:
+                resetRecording()
+                break
+
+            case ActionState.Add:
+                codeBlocks.value.push(code)
+                break
+
+            default:
+                break
+        }
     })
 })
 </script>

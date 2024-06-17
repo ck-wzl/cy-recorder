@@ -4,8 +4,9 @@
 
 // popup里面代码块的类型
 export interface ICodeBlock {
-    code: string;
-    prompt: string;
+    code: string,
+    prompt: string,
+    [key: string]: string | undefined, // 添加字符串索引签名
 }
 
 // helper中事件的类型
@@ -18,5 +19,5 @@ export interface ParsedEvent {
     key?: string,
     href?: string,
     inputType?: string,
-    [key: string]: string | undefined; // 添加字符串索引签名
+    [key: string]: string | undefined, // 添加字符串索引签名
 }

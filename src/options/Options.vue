@@ -1,7 +1,7 @@
 <template>
     <main class="option-main">
         <a-select v-model:value="curSelectors" class="option-select" :maxTagCount="4" :maxTagTextLength="12"
-            listHeight="200" mode="multiple" style="width: 100%" :options="options" @change="handleChange"></a-select>
+            :listHeight="200" mode="multiple" style="width: 100%" :options="options" @change="handleChange"></a-select>
         <div v-if="!!showText" class="option-text">{{ showText }}</div>
         <div v-if="!!showTip" class="option-tip">{{ showTip }}</div>
     </main>
@@ -11,17 +11,6 @@
 /**
  * @file Options组件主入口
  */
-
-import { useWebExtensionStorage } from '~/composables/useWebExtensionStorage'
-
-// 提示的文本
-const showTip = ref('')
-
-// showTip的timerid
-const timerId = ref<NodeJS.Timeout | null>(null)
-
-// 展示的文本
-const showText = computed(() => curSelectors.value.join(' >> '))
 
 // 选项配置
 const options = [
@@ -35,29 +24,55 @@ const options = [
     { value: 'test-id' },
 ]
 
+// 提示的文本
+const showTip = ref('')
+
+// showTip的timerid
+const timerId = ref<NodeJS.Timeout | null>(null)
+
+const originList = options.map(item => item.value)
+
 // 当前的选项配置
-const optionList = useWebExtensionStorage('optionList', options.map(i => i.value))
+const optionList = ref(originList)
 
 // 当前选择的选择器，默认选择全部
-const curSelectors = useWebExtensionStorage('curSelectors', [...optionList.value])
+const curSelectors = ref([...optionList.value])
+
+// 展示的文本
+const showText = computed(() => curSelectors.value.join(' >> '))
+
+onMounted(() => {
+    browser.storage.local.get(['options', 'selectors']).then((result: any) => {
+        if (result.options) optionList.value = result.options
+        if (result.selectors) curSelectors.value = result.selectors
+    })
+})
 
 // 处理选择器的改变事件
 const handleChange = () => {
-    if (timerId.value) {
-        showTip.value = ''
-        clearTimeout(timerId.value)
-        timerId.value = null
-    }
+    browser.storage.local.set({
+        options: optionList.value,
+        selectors: curSelectors.value
+    }).then(() => {
+        console.log('[cypress-recorder] options 存储设置成功')
+        console.log('[cypress-recorder] selectors 存储设置成功')
 
-    showTip.value = 'Configuration successful!'
-
-    timerId.value = setTimeout(() => {
         if (timerId.value) {
             showTip.value = ''
             clearTimeout(timerId.value)
             timerId.value = null
         }
-    }, 800)
+
+        showTip.value = 'Configuration successful!'
+
+        timerId.value = setTimeout(() => {
+            if (timerId.value) {
+                showTip.value = ''
+                clearTimeout(timerId.value)
+                timerId.value = null
+            }
+        }, 800)
+    })
 }
 </script>
 

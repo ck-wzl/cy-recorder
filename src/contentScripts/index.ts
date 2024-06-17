@@ -1,79 +1,82 @@
 import { sendMessage } from 'webext-bridge/content-script'
 import { finder, Options } from '@medv/finder'
 import { EventType } from '~/constants'
-import { useWebExtensionStorage } from '~/composables/useWebExtensionStorage'
 import type { ParsedEvent } from '~/interface'
 
 // 生成格式化的数据
-const getFormattedValue = (event: Event) => {
-  // 选中的选择器
-  const selectorList = useWebExtensionStorage('curSelectors', [] as string[])
+const getFormattedValue = (event: Event): Promise<ParsedEvent> => {
+  let selectorList: string[] = []
+  let optionList: string[] = []
 
-  // 全部的选择器
-  const optionList = useWebExtensionStorage('optionList', [] as string[])
+  return new Promise((resolve) => {
+    browser.storage.local.get(['options', 'selectors']).then((result: any) => {
+      if (result.options) optionList = result.options
+      if (result.selectors) selectorList = result.selectors
+    })
 
-  let curSelector = ""
+    let curSelector = ""
 
-  // 当前的选择器，一个一个的遍历selectorList
-  for (const item of selectorList.value) {
-    if ((event.target as Element).hasAttribute(item)) {
-      curSelector = `[${item}=${(event.target as Element).getAttribute(item)}]`
-      break
-    }
-  }
-
-  // 如果没有上面的自定义选择器，就使用finder来生成
-  if (!curSelector) {
-    const finderConfig: Options = {
-      root: document.body,
-      idName: (name) => true,
-      className: (name) => true,
-      tagName: (name) => true,
-      attr: (name) => optionList.value.includes(name),
-      seedMinLength: 1,
-      optimizedMinLength: 2,
-      threshold: 1000,
-      maxNumberOfTries: 10_000,
-      timeoutMs: void 0,
+    // 当前的选择器，一个一个的遍历selectorList
+    for (const item of selectorList) {
+      if ((event.target as Element).hasAttribute(item)) {
+        curSelector = `[${item}=${(event.target as Element).getAttribute(item)}]`
+        break
+      }
     }
 
-    curSelector = finder(event.target as Element, finderConfig)
-  }
+    // 如果没有上面的自定义选择器，就使用finder来生成
+    if (!curSelector) {
+      const finderConfig: Options = {
+        root: document.body,
+        idName: () => true,
+        className: () => true,
+        tagName: () => true,
+        attr: (name) => optionList.includes(name),
+        seedMinLength: 1,
+        optimizedMinLength: 2,
+        threshold: 1000,
+        maxNumberOfTries: 10_000,
+        timeoutMs: void 0,
+      }
 
-  const parsedEvent: ParsedEvent = {
-    selector: curSelector,
-    action: event.type,
-    tag: (event.target as Element).tagName,
-    value: (event.target as HTMLInputElement).value,
-  }
+      curSelector = finder(event.target as Element, finderConfig)
+    }
 
-  if ((event.target as HTMLAnchorElement).hasAttribute('href')) {
-    parsedEvent.href = (event.target as HTMLAnchorElement).href
-  }
+    const parsedEvent: ParsedEvent = {
+      selector: curSelector,
+      action: event.type,
+      tag: (event.target as Element).tagName,
+      value: (event.target as HTMLInputElement).value,
+    }
 
-  if ((event.target as Element).hasAttribute('id')) {
-    parsedEvent.id = (event.target as Element).id
-  }
+    if ((event.target as HTMLAnchorElement).hasAttribute('href')) {
+      parsedEvent.href = (event.target as HTMLAnchorElement).href
+    }
 
-  if (parsedEvent.tag === 'INPUT') {
-    parsedEvent.inputType = (event.target as HTMLInputElement).type
-  }
+    if ((event.target as Element).hasAttribute('id')) {
+      parsedEvent.id = (event.target as Element).id
+    }
 
-  if (event.type === 'keydown') {
-    parsedEvent.key = (event as KeyboardEvent).key
-  }
+    if (parsedEvent.tag === 'INPUT') {
+      parsedEvent.inputType = (event.target as HTMLInputElement).type
+    }
 
-  return parsedEvent
+    if (event.type === 'keydown') {
+      parsedEvent.key = (event as KeyboardEvent).key
+    }
+
+    resolve(parsedEvent)
+  })
 }
 
 // 处理监听事件的事件
-const handleEventListener = (event: Event) => {
+const handleEventListener = async (event: Event) => {
   // 用户实际操作的事件
   if (event.isTrusted !== true) {
     return
   }
 
-  const eventObject: ParsedEvent = getFormattedValue(event)
+  const eventObject = await getFormattedValue(event)
 
   sendMessage('content-event-message', { event: eventObject })
     .then(() => console.log('[cypress-recorder][content]发送消息成功', eventObject))
